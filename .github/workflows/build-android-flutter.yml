@@ -1,0 +1,578 @@
+name: Build Android (Flutter)
+run-name: "Android (Flutter) build (${{ inputs.build_id }})"
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_id:   { description: "Lovable project ID", required: true, type: string }
+      build_id:     { description: "Lovable build ID",   required: true, type: string }
+      config:       { description: "JSON-encoded build configuration", required: true, type: string }
+
+concurrency:
+  group: android-flutter-${{ inputs.project_id }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+    env:
+      LOVABLE_PROJECT_ID: ${{ inputs.project_id }}
+      LOVABLE_BUILD_ID:   ${{ inputs.build_id }}
+      APP_VERSION:        ${{ fromJSON(inputs.config).app_version }}
+      BUILD_NUMBER:       ${{ fromJSON(inputs.config).build_number }}
+      APP_NAME:           ${{ fromJSON(inputs.config).app_name }}
+      BUNDLE_ID:          ${{ fromJSON(inputs.config).bundle_id }}
+      REPORT_URL:         ${{ fromJSON(inputs.config).report_url }}
+      REPORT_TOKEN:       ${{ fromJSON(inputs.config).report_token }}
+      BUILD_TYPE:         ${{ fromJSON(inputs.config).build_type }}
+      SKIP_ARTIFACT_UPLOAD: ${{ fromJSON(inputs.config).skip_artifact_upload }}
+    steps:
+
+      - name: Configure Lovable reporter
+        shell: bash
+        run: |
+          cat > /tmp/lov_report <<'BASH'
+          #!/usr/bin/env bash
+          set -u
+
+          post_payload() {
+            # Capture response so validation errors from report-build (e.g.
+            # rejected artifacts) surface in the runner log instead of being
+            # silently dropped.
+            local resp http
+            resp="$(curl -sS -o /tmp/lov_report_resp -w '%{http_code}' -X POST -H "Content-Type: application/json" --data "$1" "$REPORT_URL" 2>/dev/null || echo 000)"
+            http="$resp"
+            if [ "$http" != "200" ] && [ "$http" != "000" ]; then
+              echo "::warning::report-build returned HTTP $http" >&2
+              head -c 4000 /tmp/lov_report_resp >&2 || true
+              echo >&2
+            elif [ -s /tmp/lov_report_resp ] && grep -q '"artifact_errors"' /tmp/lov_report_resp 2>/dev/null; then
+              echo "::warning::report-build accepted request but rejected one or more artifacts:" >&2
+              head -c 4000 /tmp/lov_report_resp >&2 || true
+              echo >&2
+            fi
+          }
+
+          make_payload() {
+            python3 - "$@" <<'PYJSON'
+          import json, os, sys
+          mode = sys.argv[1] if len(sys.argv) > 1 else ""
+          payload = {
+              "build_id": os.environ.get("LOVABLE_BUILD_ID", ""),
+              "token": os.environ.get("REPORT_TOKEN", ""),
+          }
+          if mode == "status":
+              payload["status"] = sys.argv[2] if len(sys.argv) > 2 else "building"
+          elif mode == "log":
+              payload["log"] = sys.argv[2] if len(sys.argv) > 2 else ""
+              payload["level"] = sys.argv[3] if len(sys.argv) > 3 else "info"
+          elif mode == "fingerprint":
+              # Signing certificate fingerprints only. Never carries passwords
+              # or raw keytool output.
+              payload["keystore_sha1"] = sys.argv[2] if len(sys.argv) > 2 else ""
+              payload["keystore_sha256"] = sys.argv[3] if len(sys.argv) > 3 else ""
+          elif mode == "ios_fingerprint":
+              # Apple signing certificate fingerprints only. Never carries the
+              # .p12 password or raw openssl output.
+              payload["apple_cert_sha1"] = sys.argv[2] if len(sys.argv) > 2 else ""
+              payload["apple_cert_sha256"] = sys.argv[3] if len(sys.argv) > 3 else ""
+          elif mode == "final":
+              payload["status"] = sys.argv[2] if len(sys.argv) > 2 else "failed"
+              payload["error_message"] = sys.argv[3] if len(sys.argv) > 3 else ""
+              if len(sys.argv) > 4 and sys.argv[4]:
+                  payload["failed_step"] = sys.argv[4]
+              if len(sys.argv) > 5 and sys.argv[5]:
+                  payload["error_summary"] = sys.argv[5]
+              if len(sys.argv) > 6 and sys.argv[6]:
+                  payload["error_category"] = sys.argv[6]
+          elif mode == "fail":
+              # args: step, summary, tail_file, category
+              payload["failed_step"] = sys.argv[2] if len(sys.argv) > 2 else ""
+              payload["error_summary"] = sys.argv[3] if len(sys.argv) > 3 else ""
+              tail_file = sys.argv[4] if len(sys.argv) > 4 else ""
+              if len(sys.argv) > 5 and sys.argv[5]:
+                  payload["error_category"] = sys.argv[5]
+              if tail_file and os.path.exists(tail_file):
+                  try:
+                      with open(tail_file, "r", errors="replace") as fh:
+                          lines = [l.rstrip("\n") for l in fh.readlines()]
+                      payload["log_tail"] = lines[-80:]
+                  except Exception:
+                      pass
+          elif mode == "artifacts":
+              # args: one or more glob-expanded file paths produced by the build.
+              # For each file: hash it, request a signed upload URL for the
+              # private 'artifacts' bucket, PUT the bytes directly to Storage,
+              # then include storage_path in the artifacts payload so the
+              # download UI can mint fresh expiring signed URLs.
+              import glob, hashlib, urllib.request, urllib.error
+              # Sandbox builds prove the build and signing work, and stop there:
+              # nothing is uploaded or recorded, so nothing becomes downloadable.
+              # The server refuses these files as well; this just keeps the
+              # runner from trying, and tells the person what happened.
+              sandbox = os.environ.get("SKIP_ARTIFACT_UPLOAD", "").strip().lower() == "true"
+              report_url = os.environ.get("REPORT_URL", "")
+              base = report_url.rsplit("/", 1)[0]  # strip trailing /report-build
+              upload_endpoint = base + "/artifact-upload-url"
+              build_id = os.environ.get("LOVABLE_BUILD_ID", "")
+              token = os.environ.get("REPORT_TOKEN", "")
+              seen = set()
+              artifacts = []
+              for pattern in ([] if sandbox else sys.argv[2:]):
+                  for path in sorted(glob.glob(pattern)):
+                      if not os.path.isfile(path) or path in seen:
+                          continue
+                      seen.add(path)
+                      name = os.path.basename(path)
+                      lower = name.lower()
+                      kind = ("apk" if lower.endswith(".apk")
+                              else "aab" if lower.endswith(".aab")
+                              else "ipa" if lower.endswith(".ipa")
+                              else "other")
+                      if kind == "other":
+                          continue
+                      try:
+                          size = os.path.getsize(path)
+                      except OSError:
+                          size = None
+                      sha = hashlib.sha256()
+                      try:
+                          with open(path, "rb") as fh:
+                              for chunk in iter(lambda: fh.read(1 << 20), b""):
+                                  sha.update(chunk)
+                          digest = sha.hexdigest()
+                      except OSError:
+                          digest = None
+                      storage_path = None
+                      try:
+                          req = urllib.request.Request(
+                              upload_endpoint,
+                              data=json.dumps({"build_id": build_id, "token": token, "filename": name}).encode(),
+                              headers={"Content-Type": "application/json"},
+                              method="POST",
+                          )
+                          with urllib.request.urlopen(req, timeout=30) as resp:
+                              signed = json.loads(resp.read())
+                          upload_url = signed.get("upload_url")
+                          storage_path = signed.get("path")
+                          if upload_url and storage_path:
+                              with open(path, "rb") as fh:
+                                  put = urllib.request.Request(
+                                      upload_url,
+                                      data=fh.read(),
+                                      headers={"Content-Type": "application/octet-stream", "x-upsert": "true"},
+                                      method="PUT",
+                                  )
+                                  urllib.request.urlopen(put, timeout=600).read()
+                      except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError) as exc:
+                          sys.stderr.write("artifact upload failed for {}: {}\n".format(name, exc))
+                          storage_path = None
+                      artifacts.append({
+                          "filename": name,
+                          "kind": kind,
+                          "size_bytes": size,
+                          "sha256": digest,
+                          "storage_path": storage_path,
+                      })
+              payload["artifacts"] = artifacts
+              if sandbox:
+                  payload["log"] = "Sandbox build: the signed file was produced and checked, and is not kept. Run a regular build to download it."
+                  payload["level"] = "success"
+          print(json.dumps(payload))
+          PYJSON
+          }
+
+
+          extract_summary() {
+            # Pick the most descriptive line from a log file: prefer first line
+            # containing error/failed/exception, else the last non-empty line.
+            local file="$1"
+            local s
+            s="$(grep -iE '(^npm (ERR!|error)|ERESOLVE|EUSAGE|Could not find|Unable to resolve|Capacitor.*(error|failed)|failed to|exception|fatal|denied)' "$file" 2>/dev/null | head -n 1 || true)"
+            if [ -z "$s" ]; then
+              s="$(grep -iE 'error|failed|exception|fatal|denied' "$file" 2>/dev/null | head -n 1 || true)"
+            fi
+            if [ -z "$s" ]; then
+              # Last non-empty line. Deliberately not `tac`: that is GNU
+              # coreutils and does not exist on the macOS runners used for iOS,
+              # so this fallback silently produced an empty summary there.
+              s="$(grep -E '\S' "$file" 2>/dev/null | tail -n 1 || true)"
+            fi
+            # Trim and cap length
+            printf '%s' "$s" | tr -d '\r' | cut -c1-400
+          }
+
+          classify_error() {
+            # Emit a single structured category the UI can render as a badge.
+            # Order matters: signing/github-app checked first so they aren't
+            # shadowed by generic gradle/xcode failures they trigger.
+            local step="$1"
+            local file="$2"
+            local haystack=""
+            [ -n "$step" ] && haystack="$step "
+            if [ -n "$file" ] && [ -f "$file" ]; then
+              haystack="$haystack$(tail -c 20000 "$file" 2>/dev/null || true)"
+            fi
+            local lc
+            lc="$(printf '%s' "$haystack" | tr '[:upper:]' '[:lower:]')"
+            case "$lc" in
+              *"github app"*|*"app not installed"*|*"installation not found"*|*"resource not accessible by integration"*|*"bad credentials"*|*"repository not accessible"*)
+                printf 'github_app_error'; return ;;
+            esac
+            case "$lc" in
+              *"command not found"*|*"is not recognized as"*|*"executable file not found"*|*"/usr/bin/env:"*)
+                printf 'missing_tool_error'; return ;;
+            esac
+            case "$lc" in
+              *"could not resolve entry module"*|*"no index.html"*|*"npm error code enoent"*|*"missing script: \"build\""*|*"no package.json"*|*"enoent: no such file or directory, open 'package.json'"*)
+                printf 'project_structure_error'; return ;;
+            esac
+            case "$lc" in
+              *"keystore"*|*"jarsigner"*|*"apksigner"*|*"code sign"*|*"codesign"*|*"provisioning profile"*|*"no signing certificate"*|*"apple_cert"*|*"android_key"*|*"signingconfig"*)
+                printf 'signing_error'; return ;;
+            esac
+            # Transient infrastructure is checked BEFORE the tool-specific
+            # buckets. A Gradle or Xcode step that dies on a socket timeout is a
+            # timeout, not a build-config bug, and labelling it gradle_error
+            # sends the user to rewrite build.gradle instead of re-running.
+            # Order must match classifyBuildError() in _shared/projectDetection.ts.
+            case "$lc" in
+              *"etimedout"*|*"timed out"*|*"timeout"*|*"deadline exceeded"*)
+                printf 'timeout_error'; return ;;
+            esac
+            case "$lc" in
+              *"econnreset"*|*"econnrefused"*|*"getaddrinfo"*|*"network is unreachable"*|*"could not resolve host"*|*"tls handshake"*)
+                printf 'network_error'; return ;;
+            esac
+            case "$lc" in
+              *"gradle"*|*"aapt"*|*"execution failed for task"*|*":app:"*)
+                printf 'gradle_error'; return ;;
+            esac
+            case "$lc" in
+              *"xcodebuild"*|*"xcode "*|*"** archive failed"*|*"** export failed"*|*"exportarchive"*)
+                printf 'xcode_error'; return ;;
+            esac
+            case "$lc" in
+              *"cocoapods"*|*"pod install"*|*"pod repo"*|*"cdn: trunk"*)
+                printf 'cocoapods_error'; return ;;
+            esac
+            # NB: bare install commands ("npm ci", "npm install") are NOT
+            # needles — the runner echoes the command before running it, so
+            # matching them labelled every install failure an npm_error.
+            case "$lc" in
+              *"npm err"*|*"eresolve"*|*"eusage"*|*"peer dep"*|*"unable to resolve dependency"*|*"err_pnpm"*)
+                printf 'npm_error'; return ;;
+            esac
+            case "$lc" in
+              *"capacitor"*|*"cap sync"*|*"cap add"*)
+                printf 'capacitor_error'; return ;;
+            esac
+            case "$lc" in
+              *"error during build"*|*"build failed in"*|*"transform failed"*|*"rollup"*|*"vite build"*)
+                printf 'web_build_error'; return ;;
+            esac
+            printf 'unknown'
+          }
+
+
+          mode="${1:-}"; shift || true
+          if [ "$mode" = "status" ]; then
+            post_payload "$(make_payload status "${1:-building}")"
+          elif [ "$mode" = "log" ]; then
+            post_payload "$(make_payload log "${1:-}" "${2:-info}")"
+          elif [ "$mode" = "fingerprint" ]; then
+            # fingerprint <sha1> <sha256>
+            post_payload "$(make_payload fingerprint "${1:-}" "${2:-}")"
+          elif [ "$mode" = "ios_fingerprint" ]; then
+            # ios_fingerprint <sha1> <sha256>
+            post_payload "$(make_payload ios_fingerprint "${1:-}" "${2:-}")"
+          elif [ "$mode" = "final" ]; then
+            # final <status> <error_message> [failed_step] [error_summary] [error_category]
+            post_payload "$(make_payload final "${1:-failed}" "${2:-}" "${3:-}" "${4:-}" "${5:-}")"
+          elif [ "$mode" = "fail" ]; then
+            # fail <step> <summary> <tail_file> [category]
+            # REPORT_FINAL (if: always()) reads these three files. Without them
+            # it overwrites this report with category=unknown and a generic
+            # "Workflow job failed" message, losing the real cause.
+            echo "${1:-}" > /tmp/lov_failed_step
+            printf '%s' "${2:-}" > /tmp/lov_error_summary
+            printf '%s' "${4:-}" > /tmp/lov_error_category
+            post_payload "$(make_payload fail "${1:-}" "${2:-}" "${3:-}" "${4:-}")"
+          elif [ "$mode" = "artifacts" ]; then
+            # artifacts <glob> [<glob>...] — hash each file & POST size + sha256
+            post_payload "$(make_payload artifacts "$@")"
+          elif [ "$mode" = "run" ]; then
+            label="${1:-Step}"; shift || true
+            tmp="$(mktemp)"
+            "$0" log "$label"
+            set +e
+            # Use a pipeline, not `> >(tee "$tmp")`. With process substitution
+            # the shell continues as soon as the command exits, so
+            # extract_summary/classify_error below can read $tmp before tee has
+            # flushed it — producing blank summaries and 'unknown' categories
+            # for failures that actually had a clear cause in the log.
+            "$@" 2>&1 | tee "$tmp"
+            status=${PIPESTATUS[0]}
+            set -e
+            if [ "$status" -ne 0 ]; then
+              summary="$(extract_summary "$tmp")"
+              [ -z "$summary" ] && summary="$label failed with exit code $status"
+              category="$(classify_error "$label" "$tmp")"
+              # Record the failing step so the final-status step can include it.
+              echo "$label" > /tmp/lov_failed_step
+              printf '%s' "$summary" > /tmp/lov_error_summary
+              printf '%s' "$category" > /tmp/lov_error_category
+              echo "::warning::Build step '$label' failed — category=$category"
+              tail -n 120 "$tmp" | while IFS= read -r line; do "$0" log "$line" error; done
+              "$0" log "Category: $category" error
+              "$0" fail "$label" "$summary" "$tmp" "$category"
+              "$0" log "$label failed with exit code $status" error
+              exit "$status"
+            fi
+            "$0" log "$label complete" success
+          fi
+          BASH
+          chmod +x /tmp/lov_report
+          echo "/tmp" >> "$GITHUB_PATH"
+      - name: Verify reporter prerequisites
+        shell: bash
+        run: |
+          # Every log line, status update and artifact upload goes through
+          # curl + python3. If either is missing the reporter fails silently and
+          # the build shows "no logs" in the UI for 45 minutes, so check here and
+          # say so out loud. Reported with a hand-built payload because
+          # lov_report itself needs python3.
+          missing=""
+          command -v curl >/dev/null 2>&1 || missing="curl"
+          command -v python3 >/dev/null 2>&1 || missing="${missing:+$missing and }python3"
+          if [ -n "$missing" ]; then
+            echo "::error::Build runner is missing $missing, which Corenna needs to stream build logs."
+            if command -v curl >/dev/null 2>&1; then
+              curl -sS -X POST -H "Content-Type: application/json" \
+                --data "{\"build_id\":\"$LOVABLE_BUILD_ID\",\"token\":\"$REPORT_TOKEN\",\"status\":\"failed\",\"error_message\":\"Build runner is missing $missing\",\"failed_step\":\"Verify reporter prerequisites\",\"error_category\":\"missing_tool_error\"}" \
+                "$REPORT_URL" >/dev/null 2>&1 || true
+            fi
+            exit 1
+          fi
+      - name: Report build started
+        shell: bash
+        run: lov_report status building
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Detect Flutter project
+        shell: bash
+        run: |
+          # pubspec.yaml with a `flutter:` section is what makes this a Flutter
+          # app rather than a plain Dart package. Searched shallowly so a
+          # pubspec inside example/ or a vendored plugin cannot win.
+          root=""
+          for candidate in . $(find . -maxdepth 3 -name pubspec.yaml -not -path "*/build/*" -not -path "*/.*" -exec dirname {} + 2>/dev/null | sort -u); do
+            if [ -f "$candidate/pubspec.yaml" ] && grep -qE "^[[:space:]]*flutter:" "$candidate/pubspec.yaml"; then
+              root="$candidate"; break
+            fi
+          done
+          if [ -z "$root" ]; then
+            lov_report fail "Detect Flutter project" "No pubspec.yaml with a flutter: section was found within three directory levels. Is this a Flutter app?" "" "detect_error"
+            exit 1
+          fi
+          if [ ! -d "$root/android" ]; then
+            lov_report fail "Detect Flutter project" "No android/ directory in the Flutter project. Run 'flutter create --platforms=android .' and commit the result." "" "detect_error"
+            exit 1
+          fi
+          echo "APP_DIR=$root" >> "$GITHUB_ENV"
+          lov_report log "Flutter project at $root" success
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Resolve dependencies
+        working-directory: ${{ env.APP_DIR }}
+        shell: bash
+        run: lov_report run "flutter pub get" flutter pub get
+      - name: Configure Android signing
+        working-directory: ${{ env.APP_DIR }}
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -n "${ANDROID_KEYSTORE_BASE64:-}" ] && [ -n "${ANDROID_KEYSTORE_PASSWORD:-}" ] && [ -n "${ANDROID_KEY_ALIAS:-}" ] && [ -n "${ANDROID_KEY_PASSWORD:-}" ]; then
+            mkdir -p android/app
+            echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > android/app/release.keystore
+            # Capture the upload-certificate fingerprints. Output is captured,
+            # never printed: keytool -list -v echoes certificate details and we
+            # must not leak the store password or the raw dump into build logs.
+            ks_out="$(cd android/app && keytool -list -v -keystore release.keystore -alias "$ANDROID_KEY_ALIAS" -storepass "$ANDROID_KEYSTORE_PASSWORD" 2>/dev/null)" || ks_out=""
+            ks_sha1="$(printf '%s\n' "$ks_out" | grep -E '^[[:space:]]*SHA1:' | head -n 1 | sed -E 's/^[[:space:]]*SHA1:[[:space:]]*//' | tr -d '\r' | tr '[:lower:]' '[:upper:]')"
+            ks_sha256="$(printf '%s\n' "$ks_out" | grep -E '^[[:space:]]*SHA256:' | head -n 1 | sed -E 's/^[[:space:]]*SHA256:[[:space:]]*//' | tr -d '\r' | tr '[:lower:]' '[:upper:]')"
+            ks_out=""
+            unset ks_out
+            if [ -n "$ks_sha1" ] && [ -n "$ks_sha256" ]; then
+              lov_report fingerprint "$ks_sha1" "$ks_sha256"
+              lov_report log "Upload certificate fingerprints recorded" success
+            fi
+            cat > android/keystore.properties <<EOF
+          storePassword=$ANDROID_KEYSTORE_PASSWORD
+          keyPassword=$ANDROID_KEY_PASSWORD
+          keyAlias=$ANDROID_KEY_ALIAS
+          storeFile=release.keystore
+          EOF
+            # Idempotent: skip appending the lovableRelease signing block if a
+            # previous run on the same checkout (cached workspace, re-run, etc.)
+            # already added it — Gradle errors on duplicate signingConfigs.
+            if [ -f android/app/build.gradle.kts ]; then
+              # Kotlin DSL, which recent `flutter create` generates. Appending
+              # the Groovy block below would create a second build file next to
+              # it instead, and the build fails. Plain Kotlin reads the
+              # properties: in a build script `java` is the Java extension, so
+              # `java.util.Properties` does not compile, and an import cannot
+              # be appended to the end of a file.
+              if ! grep -q "lovableRelease" android/app/build.gradle.kts; then
+                cat >> android/app/build.gradle.kts <<'EOF'
+
+          val lovableKeystoreProperties: Map<String, String> = rootProject.file("keystore.properties").let { propsFile ->
+              if (!propsFile.exists()) emptyMap()
+              else propsFile.readLines()
+                  .filter { it.contains('=') && !it.trimStart().startsWith("#") }
+                  .associate { it.substringBefore('=').trim() to it.substringAfter('=').trimStart() }
+          }
+
+          android {
+              signingConfigs {
+                  create("lovableRelease") {
+                      storeFile = file(lovableKeystoreProperties.getValue("storeFile"))
+                      storePassword = lovableKeystoreProperties["storePassword"]
+                      keyAlias = lovableKeystoreProperties["keyAlias"]
+                      keyPassword = lovableKeystoreProperties["keyPassword"]
+                  }
+              }
+              buildTypes {
+                  getByName("release") {
+                      signingConfig = signingConfigs.getByName("lovableRelease")
+                  }
+              }
+          }
+          EOF
+              fi
+            elif ! grep -q "lovableRelease" android/app/build.gradle; then
+              cat >> android/app/build.gradle <<'EOF'
+
+          def lovableKeystoreProperties = new Properties()
+          def lovableKeystorePropertiesFile = rootProject.file('keystore.properties')
+          if (lovableKeystorePropertiesFile.exists()) {
+              lovableKeystoreProperties.load(new FileInputStream(lovableKeystorePropertiesFile))
+          }
+
+          android {
+              signingConfigs {
+                  lovableRelease {
+                      storeFile file(lovableKeystoreProperties['storeFile'])
+                      storePassword lovableKeystoreProperties['storePassword']
+                      keyAlias lovableKeystoreProperties['keyAlias']
+                      keyPassword lovableKeystoreProperties['keyPassword']
+                  }
+              }
+              buildTypes {
+                  release {
+                      signingConfig signingConfigs.lovableRelease
+                  }
+              }
+          }
+          EOF
+            fi
+            if [ "${{ env.BUILD_TYPE }}" = "aab" ]; then
+              echo "ANDROID_BUILD_TASK=:app:bundleRelease" >> "$GITHUB_ENV"
+            else
+              echo "ANDROID_BUILD_TASK=:app:assembleRelease" >> "$GITHUB_ENV"
+            fi
+            lov_report log "Android signing configured (target: ${{ env.BUILD_TYPE }})" success
+          else
+            lov_report fail "Configure Android signing" "Android signing secrets are incomplete; refusing to produce an unsigned debug artifact" "" "signing_error"
+            exit 1
+          fi
+      - name: Build Flutter Android artifact
+        working-directory: ${{ env.APP_DIR }}
+        shell: bash
+        run: |
+          # Gradle is driven through the Flutter tool rather than called
+          # directly: the Dart AOT snapshot and the plugin registrant are
+          # produced as part of this, and a bare ./gradlew would yield an app
+          # with no Dart code in it.
+          if [ "${{ env.BUILD_TYPE }}" = "aab" ]; then
+            target="appbundle"
+          else
+            target="apk"
+          fi
+          lov_report run "flutter build $target" flutter build "$target" --release --build-name="$APP_VERSION" --build-number="$BUILD_NUMBER"
+      - name: Report Flutter artifact metadata
+        if: success()
+        working-directory: ${{ env.APP_DIR }}
+        shell: bash
+        run: |
+          # Flutter writes under <root>/build/app/outputs, not
+          # android/app/build/outputs the way a plain Gradle project does.
+          shopt -s nullglob
+          files=(build/app/outputs/flutter-apk/*.apk \
+                 build/app/outputs/apk/*/*.apk \
+                 build/app/outputs/bundle/*/*.aab)
+          if [ ${#files[@]} -eq 0 ]; then
+            lov_report fail "Report Flutter artifact metadata" "flutter build reported success but no .apk/.aab was found under build/app/outputs." "" "gradle_error"
+            exit 1
+          fi
+          lov_report log "Found ${#files[@]} Flutter artifact(s)" success
+          lov_report artifacts \
+            'build/app/outputs/flutter-apk/*.apk' \
+            'build/app/outputs/apk/*/*.apk' \
+            'build/app/outputs/bundle/*/*.aab'
+      - name: Upload Flutter Android artifact
+        if: ${{ env.SKIP_ARTIFACT_UPLOAD != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-release-${{ env.BUILD_TYPE }}-${{ env.BUILD_NUMBER }}
+          path: |
+            ${{ env.APP_DIR }}/build/app/outputs/flutter-apk/*.apk
+            ${{ env.APP_DIR }}/build/app/outputs/apk/*/*.apk
+            ${{ env.APP_DIR }}/build/app/outputs/bundle/*/*.aab
+          if-no-files-found: error
+          retention-days: 30
+      - name: Report artifact
+        shell: bash
+        run: |
+          if [ "${{ env.SKIP_ARTIFACT_UPLOAD }}" = "true" ]; then
+            lov_report log "Sandbox build: artifact upload skipped" success
+          else
+            lov_report log "Android ${{ env.BUILD_TYPE }} artifact uploaded (#${{ env.BUILD_NUMBER }})" success
+          fi
+
+      - name: Report final status
+        if: always()
+        shell: bash
+        run: |
+          failed_step=""
+          error_summary=""
+          error_category=""
+          if [ -f /tmp/lov_failed_step ]; then failed_step="$(cat /tmp/lov_failed_step)"; fi
+          if [ -f /tmp/lov_error_summary ]; then error_summary="$(cat /tmp/lov_error_summary)"; fi
+          if [ -f /tmp/lov_error_category ]; then error_category="$(cat /tmp/lov_error_category)"; fi
+          if [ "${{ job.status }}" = "success" ]; then
+            lov_report final success "" "" "" ""
+          elif [ "${{ job.status }}" = "cancelled" ]; then
+            lov_report final cancelled "Workflow cancelled" "$failed_step" "$error_summary" "$error_category"
+          else
+            msg="Workflow job failed (see GitHub Actions logs)"
+            [ -n "$error_summary" ] && msg="$error_summary"
+            [ -z "$error_category" ] && error_category="unknown"
+            lov_report final failed "$msg" "$failed_step" "$error_summary" "$error_category"
+          fi
