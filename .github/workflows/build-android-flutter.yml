@@ -27,11 +27,28 @@ jobs:
       APP_NAME:           ${{ fromJSON(inputs.config).app_name }}
       BUNDLE_ID:          ${{ fromJSON(inputs.config).bundle_id }}
       REPORT_URL:         ${{ fromJSON(inputs.config).report_url }}
-      REPORT_TOKEN:       ${{ fromJSON(inputs.config).report_token }}
       BUILD_TYPE:         ${{ fromJSON(inputs.config).build_type }}
       SKIP_ARTIFACT_UPLOAD: ${{ fromJSON(inputs.config).skip_artifact_upload }}
     steps:
 
+      - name: Keep the report token out of the logs
+        shell: bash
+        run: |
+          # The token that lets this run report to Corenna comes in the
+          # dispatch inputs. Set as a job env var, GitHub printed it at the top
+          # of every step, so anyone who could read a public repo's Actions
+          # logs could post this build's status and files. It is read from the
+          # event file instead, masked before anything can print it, and handed
+          # to the later steps, whose logs then show *** in its place.
+          event="$GITHUB_EVENT_PATH"
+          token="$(python3 -c 'import json, sys; print(json.loads(json.load(open(sys.argv[1]))["inputs"]["config"])["report_token"])' "$event" 2>/dev/null \
+            || jq -r '.inputs.config | fromjson | .report_token' "$event" 2>/dev/null || true)"
+          if ! printf '%s' "$token" | grep -qE '^[0-9a-f]{64}$'; then
+            echo "::error::The build configuration has no report token, so this run can't report to Corenna."
+            exit 1
+          fi
+          echo "::add-mask::$token"
+          echo "REPORT_TOKEN=$token" >> "$GITHUB_ENV"
       - name: Configure Lovable reporter
         shell: bash
         run: |
@@ -101,6 +118,15 @@ jobs:
                       with open(tail_file, "r", errors="replace") as fh:
                           lines = [l.rstrip("\n") for l in fh.readlines()]
                       payload["log_tail"] = lines[-80:]
+                  except Exception:
+                      pass
+              # The secret keys a build stopped for, each shortened and with
+              # its fingerprint, so the owner can choose to build with them.
+              keys_file = sys.argv[6] if len(sys.argv) > 6 else ""
+              if keys_file and os.path.exists(keys_file):
+                  try:
+                      with open(keys_file) as fh:
+                          payload["secret_keys"] = json.load(fh)[:20]
                   except Exception:
                       pass
           elif mode == "artifacts":
@@ -294,14 +320,14 @@ jobs:
             # final <status> <error_message> [failed_step] [error_summary] [error_category]
             post_payload "$(make_payload final "${1:-failed}" "${2:-}" "${3:-}" "${4:-}" "${5:-}")"
           elif [ "$mode" = "fail" ]; then
-            # fail <step> <summary> <tail_file> [category]
+            # fail <step> <summary> <tail_file> [category] [secret_keys_json]
             # REPORT_FINAL (if: always()) reads these three files. Without them
             # it overwrites this report with category=unknown and a generic
             # "Workflow job failed" message, losing the real cause.
             echo "${1:-}" > /tmp/lov_failed_step
             printf '%s' "${2:-}" > /tmp/lov_error_summary
             printf '%s' "${4:-}" > /tmp/lov_error_category
-            post_payload "$(make_payload fail "${1:-}" "${2:-}" "${3:-}" "${4:-}")"
+            post_payload "$(make_payload fail "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}")"
           elif [ "$mode" = "artifacts" ]; then
             # artifacts <glob> [<glob>...] — hash each file & POST size + sha256
             post_payload "$(make_payload artifacts "$@")"
@@ -381,20 +407,69 @@ jobs:
             fi
           done
           if [ -z "$root" ]; then
-            lov_report fail "Detect Flutter project" "No pubspec.yaml with a flutter: section was found within three directory levels. Is this a Flutter app?" "" "detect_error"
-            exit 1
-          fi
-          if [ ! -d "$root/android" ]; then
-            lov_report fail "Detect Flutter project" "No android/ directory in the Flutter project. Run 'flutter create --platforms=android .' and commit the result." "" "detect_error"
+            lov_report fail "Detect Flutter project" "No pubspec.yaml with a flutter: section was found within three directory levels. Is this a Flutter app?" "" "project_structure_error"
             exit 1
           fi
           echo "APP_DIR=$root" >> "$GITHUB_ENV"
           lov_report log "Flutter project at $root" success
+          if [ ! -d "$root/android" ]; then
+            echo "CREATE_PLATFORM=true" >> "$GITHUB_ENV"
+            lov_report log "No android/ folder in the repo, so this build creates one" info
+          fi
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
+      - name: Create the Android project
+        if: env.CREATE_PLATFORM == 'true'
+        working-directory: ${{ env.APP_DIR }}
+        shell: bash
+        run: |
+          cat > /tmp/lov_flutter_android.sh <<'BASH'
+            set -euo pipefail
+            python3 - <<'PY'
+          import os, re, subprocess, sys
+          from pathlib import Path
+          from xml.sax.saxutils import quoteattr
+
+          bundle = os.environ["BUNDLE_ID"].strip()
+          app_name = os.environ.get("APP_NAME", "").strip()
+
+          # flutter create names the project after the folder unless told
+          # otherwise, and a repo folder is often not a valid Dart package name.
+          m = re.search(r"^name:\s*\W?([a-z0-9_]+)", Path("pubspec.yaml").read_text(), re.M)
+          if not m:
+              sys.exit("pubspec.yaml has no name: line, so the Android project can't be created")
+          org = bundle.rsplit(".", 1)[0] if "." in bundle else "com.example"
+          subprocess.run(
+              ["flutter", "create", "--platforms=android", f"--org={org}", f"--project-name={m.group(1)}", "."],
+              check=True,
+          )
+
+          def replace(path, pattern, repl, what):
+              p = Path(path)
+              text, n = re.subn(pattern, repl, p.read_text())
+              if n == 0:
+                  sys.exit(f"flutter create wrote no {what} in {path}")
+              p.write_text(text)
+
+          gradle = next((g for g in ("android/app/build.gradle.kts", "android/app/build.gradle") if Path(g).exists()), None)
+          if gradle is None:
+              sys.exit("flutter create wrote no android/app/build.gradle")
+          # The ID it writes is <org>.<package name>; the one Play knows the app by is the project's.
+          replace(gradle, r'(applicationId\s*=?\s*)"[^"]*"', lambda m: f'{m.group(1)}"{bundle}"', "applicationId")
+          if app_name:
+              replace(
+                  "android/app/src/main/AndroidManifest.xml",
+                  r'android:label="[^"]*"',
+                  lambda _: "android:label=" + quoteattr(app_name),
+                  "android:label",
+              )
+          print(f"Created the Android project as {bundle}")
+          PY
+          BASH
+          lov_report run "Create the Android project" bash /tmp/lov_flutter_android.sh
       - name: Resolve dependencies
         working-directory: ${{ env.APP_DIR }}
         shell: bash
@@ -516,6 +591,236 @@ jobs:
             target="apk"
           fi
           lov_report run "flutter build $target" flutter build "$target" --release --build-name="$APP_VERSION" --build-number="$BUILD_NUMBER"
+      - name: Report the Android target
+        if: success()
+        working-directory: ${{ env.APP_DIR }}
+        shell: bash
+        run: |
+          cat > /tmp/lov_report_target_sdk.sh <<'BASH'
+            manifest="$(find android/app/build/intermediates build/app/intermediates -path '*merged_manifest*' -name AndroidManifest.xml 2>/dev/null | head -n 1)"
+            target=""
+            if [ -n "$manifest" ]; then
+              target="$(grep -oE 'android:targetSdkVersion="[0-9]+"' "$manifest" | head -n 1 | grep -oE '[0-9]+' || true)"
+            fi
+            level=warn
+            if [ -z "$target" ]; then
+              msg="Couldn't read which Android version this build targets"
+              level=info
+            elif [ "$target" -ge 36 ]; then
+              msg="Targets Android API $target, which Google Play accepts"
+              level=success
+            elif [ "${BUILD_TYPE:-}" = "aab" ]; then
+              msg="Targets Android API $target. Google Play needs API 36 or higher for new apps and updates, so it will refuse this .aab. Move the app to Capacitor 8 (npx cap migrate), React Native 0.81 or Expo SDK 54, then build again."
+            else
+              msg="Targets Android API $target. It installs fine, but Google Play needs API 36 or higher for new apps and updates."
+            fi
+            # In the GitHub run's log as well as the build's page on Corenna.
+            if [ "$level" = warn ]; then echo "::warning::$msg"; else echo "$msg"; fi
+            lov_report log "$msg" "$level"
+          BASH
+          bash /tmp/lov_report_target_sdk.sh || true
+      - name: Check the app for secret keys
+        working-directory: ${{ env.APP_DIR }}
+        shell: bash
+        run: |
+          cat > /tmp/lov_secret_scan.py <<'PY'
+          """Looks inside a finished app (.apk, .aab, .ipa) for secret keys.
+
+          Anyone who downloads an app can unzip it: a web app's JavaScript is plain text
+          in there, and the strings in compiled code come out with any decompiler. A
+          secret key inside an app has been published to everyone who installs it.
+
+          Only keys that are secret by design, in a shape no public value shares, are
+          reported. The Supabase anon and publishable keys, a Firebase config, Stripe and
+          Paddle client keys and analytics keys are meant to ship, and never stop a build.
+
+          A key's owner can decide to ship it anyway ("Build anyway" on the project
+          page). Corenna then passes that key's fingerprint, the SHA-256 of the key, in
+          the build's config, and the key is listed in the log without stopping the
+          build. Any other key still stops it.
+
+          Usage: python3 lov_secret_scan.py SUMMARY_FILE ARTIFACT...
+          Exit 0: nothing found. Exit 3: keys found, one line each printed, a short
+          summary for the build page written to SUMMARY_FILE and the keys (kind, the
+          key shortened, file, fingerprint) to SUMMARY_FILE.json. Exit 4: only keys the
+          owner chose to keep. Any other exit is a fault in this script. Keys are never
+          printed or written whole.
+          """
+          import base64
+          import hashlib
+          import json
+          import os
+          import re
+          import sys
+          import zipfile
+
+          # What each key is, and its shape, in the order they are reported. Every
+          # pattern starts with the key's fixed prefix, which lets the regex engine jump
+          # from one candidate to the next instead of trying every rule at every byte.
+          RULES = [
+              ("a Supabase service role key", rb"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{16,}"),
+              ("a Supabase secret key", rb"sb_secret_[A-Za-z0-9_-]{20,}"),
+              ("a Stripe secret key", rb"sk_live_[A-Za-z0-9]{20,}"),
+              ("a Stripe secret key", rb"rk_live_[A-Za-z0-9]{20,}"),
+              ("a Paddle API key", rb"pdl_(?:live|sdbx)_apikey_[A-Za-z0-9_]{20,}"),
+              ("an OpenAI API key", rb"sk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{40,}"),
+              ("an OpenAI API key", rb"sk-[A-Za-z0-9]{20}T3BlbkFJ[A-Za-z0-9]{20}"),
+              ("an Anthropic API key", rb"sk-ant-(?:api|admin)[0-9]{2}-[A-Za-z0-9_-]{80,}"),
+              ("an OpenRouter API key", rb"sk-or-v1-[0-9a-f]{64}"),
+              ("a Groq API key", rb"gsk_[A-Za-z0-9]{52}\b"),
+              ("an xAI API key", rb"xai-[A-Za-z0-9]{80}\b"),
+              ("a Replicate API token", rb"r8_[A-Za-z0-9]{37}\b"),
+              ("a Hugging Face token", rb"hf_[A-Za-z]{34}\b"),
+              ("an ElevenLabs API key", rb"sk_[0-9a-f]{48}\b"),
+              ("an AWS access key", rb"AKIA[0-9A-Z]{16}\b"),
+              ("an AWS access key", rb"ASIA[0-9A-Z]{16}\b"),
+              ("a GitHub token", rb"gh[pousr]_[A-Za-z0-9]{36,}"),
+              ("a GitHub token", rb"github_pat_[A-Za-z0-9_]{80,}"),
+              ("a Resend API key", rb"re_[A-Za-z0-9]{8}_[A-Za-z0-9]{24}\b"),
+              ("a SendGrid API key", rb"SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\b"),
+              ("a Slack token", rb"xox[abprs]-[0-9]{8,}-[0-9A-Za-z-]{10,}"),
+              ("a PostHog personal API key", rb"phx_[A-Za-z0-9]{40,}"),
+              ("a private key", rb"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----(?:\\[nr]|\s)+[A-Za-z0-9+/]{64}"),
+              ("a hard-coded login", rb"Basic ([A-Za-z0-9+/]{12,}={0,2})[\"'\x60]"),
+          ]
+          COMPILED = [(name, re.compile(pattern)) for name, pattern in RULES]
+
+          # Pictures, fonts and media hold no keys, and are most of an app's size.
+          SKIP = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".ico", ".svgz", ".ttf", ".otf", ".woff",
+                  ".woff2", ".mp3", ".mp4", ".m4a", ".wav", ".ogg", ".webm", ".car")
+          MAX_ENTRY = 256 * 1024 * 1024
+
+
+          def b64(segment):
+              return base64.urlsafe_b64decode(segment + b"=" * (-len(segment) % 4))
+
+
+          def is_secret(name, match, data):
+              before = data[match.start() - 1:match.start()]
+              value = match.group(0)
+              if name == "a private key":
+                  return True  # a PEM often follows a literal \n, and its body has runs of A
+              if name == "a hard-coded login":
+                  # A whole Authorization header value written out as a string.
+                  if before not in (b'"', b"'", b"\x60"):
+                      return False
+                  try:
+                      user, _, password = b64(match.group(1)).decode("utf-8").partition(":")
+                  except Exception:
+                      return False
+                  return bool(user and password and (user + password).isprintable())
+              if before.isalnum() or before == b"_":
+                  return False  # the middle of a longer word, not a key
+              if b"EXAMPLE" in value.upper() or re.search(rb"(.)\1{7}", value):
+                  return False  # placeholders in documentation: AWS's sample key, sk_live_xxxxxxxx...
+              if name == "a Supabase service role key":
+                  # Every Supabase app ships its anon key, a JWT of the same shape. Only
+                  # one whose payload says service_role skips row level security.
+                  try:
+                      return json.loads(b64(value.split(b".")[1])).get("role") == "service_role"
+                  except Exception:
+                      return False
+              return True
+
+
+          def redact(name, value):
+              text = value.decode("ascii", "replace")
+              if name == "a Supabase service role key":
+                  return "eyJ…" + text[-4:]
+              if name == "a private key":
+                  return "-----BEGIN … PRIVATE KEY-----"
+              if name == "a hard-coded login":
+                  return "Basic …"
+              return text[: min(10, len(text) // 3)] + "…" + text[-4:]
+
+
+          def scan(paths):
+              found = {}
+              for path in paths:
+                  with zipfile.ZipFile(path) as archive:
+                      for entry in archive.infolist():
+                          if entry.is_dir() or entry.filename.lower().endswith(SKIP) or entry.file_size > MAX_ENTRY:
+                              continue
+                          data = archive.read(entry)
+                          for index, (name, pattern) in enumerate(COMPILED):
+                              for match in pattern.finditer(data):
+                                  value = match.group(0)
+                                  if value not in found and is_secret(name, match, data):
+                                      fingerprint = hashlib.sha256(value).hexdigest()
+                                      found[value] = (index, name, redact(name, value), entry.filename, fingerprint)
+              return sorted(found.values())
+
+
+          def kept_by_owner():
+              """Fingerprints of the keys this project's owner chose to build with, from
+              the config Corenna dispatched the build with. None when there is no config."""
+              try:
+                  with open(os.environ["GITHUB_EVENT_PATH"]) as fh:
+                      config = json.loads(json.load(fh)["inputs"]["config"])
+                  return {str(f) for f in config.get("accepted_secret_keys") or []}
+              except Exception:
+                  return set()
+
+
+          def summary(findings):
+              """One short paragraph for the build page, which keeps 1000 characters:
+              the first two keys by name, a count of the rest, and what to do."""
+              shown = [f"{name} ({value} in {where[-60:]})" for _, name, value, where, _ in findings[:2]]
+              if len(findings) > 2:
+                  shown.append(f"{len(findings) - 2} more listed in the build log")
+              found = shown[0] if len(shown) == 1 else ", ".join(shown[:-1]) + " and " + shown[-1]
+              if len(findings) == 1:
+                  return (
+                      f"Your app contains a secret key: {found}. Anyone who downloads the app can read it. "
+                      "Move the code that uses it to your backend, create a new key and delete this one, then build again."
+                  )
+              return (
+                  f"Your app contains {len(findings)} secret keys: {found}. Anyone who downloads the app can read them. "
+                  "Move the code that uses them to your backend, create new keys and delete these, then build again."
+              )
+
+
+          def main(argv):
+              summary_file, paths = argv[1], argv[2:]
+              findings = scan(paths)
+              kept = kept_by_owner()
+              new = [f for f in findings if f[4] not in kept]
+              for _, name, shown, where, fingerprint in findings:
+                  if fingerprint in kept:
+                      print(f"Secret key you chose to keep: {name}, {shown}, in {where}")
+                  else:
+                      print(f"Secret key found: {name}, {shown}, in {where}")
+              if not findings:
+                  print(f"No secret keys found in {len(paths)} file(s).")
+                  return 0
+              if not new:
+                  return 4
+              with open(summary_file, "w") as fh:
+                  fh.write(summary(new))
+              with open(summary_file + ".json", "w") as fh:
+                  json.dump([{"kind": name, "shown": shown, "where": where[-200:], "fingerprint": fingerprint}
+                             for _, name, shown, where, fingerprint in new[:20]], fh)
+              return 3
+
+
+          if __name__ == "__main__":
+              sys.exit(main(sys.argv))
+
+          PY
+          shopt -s nullglob
+          files=(build/app/outputs/flutter-apk/*.apk build/app/outputs/apk/*/*.apk build/app/outputs/bundle/*/*.aab)
+          # No app means the build failed to make one, which the next step reports.
+          if [ ${#files[@]} -eq 0 ]; then exit 0; fi
+          if python3 /tmp/lov_secret_scan.py /tmp/lov_secret_summary "${files[@]}" > /tmp/lov_secret_scan.log 2>&1; then status=0; else status=$?; fi
+          cat /tmp/lov_secret_scan.log
+          case "$status" in
+            0) lov_report log "No secret keys found inside the app" success ;;
+            3) lov_report fail "Check the app for secret keys" "$(cat /tmp/lov_secret_summary)" /tmp/lov_secret_scan.log "secret_key_error" /tmp/lov_secret_summary.json
+               exit 1 ;;
+            # Only keys the owner chose to build with: say so, and carry on.
+            4) grep '^Secret key you chose to keep' /tmp/lov_secret_scan.log | while IFS= read -r line; do lov_report log "$line" warn; done ;;
+            *) lov_report log "The secret key check could not run (exit $status), so this build was not checked for secret keys" warn ;;
+          esac
       - name: Report Flutter artifact metadata
         if: success()
         working-directory: ${{ env.APP_DIR }}
