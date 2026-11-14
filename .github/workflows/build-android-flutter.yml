@@ -606,7 +606,18 @@ jobs:
           else
             target="apk"
           fi
-          lov_report run "flutter build $target" flutter build "$target" --release --build-name="$APP_VERSION" --build-number="$BUILD_NUMBER"
+          # The Flutter set up above is the newest stable, and a new one can
+          # refuse an android/ folder an older one was happy with: 3.50 (Nov
+          # 2026) stops any build whose Android Gradle Plugin is below 9.1.1,
+          # so repos pinned to 9.1.0 that built the week before stopped
+          # building. That check only compares version numbers, so it is
+          # skipped and Gradle decides. The flag is passed only when this
+          # Flutter accepts it (an unknown flag stops flutter build).
+          skip_version_check=()
+          if flutter build "$target" --android-skip-build-dependency-validation --help >/dev/null 2>&1; then
+            skip_version_check=(--android-skip-build-dependency-validation)
+          fi
+          lov_report run "flutter build $target" flutter build "$target" --release --build-name="$APP_VERSION" --build-number="$BUILD_NUMBER" "${skip_version_check[@]}"
       - name: Report the Android target
         if: success()
         working-directory: ${{ env.APP_DIR }}
