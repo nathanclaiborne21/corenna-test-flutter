@@ -29,6 +29,7 @@ jobs:
       REPORT_URL:         ${{ fromJSON(inputs.config).report_url }}
       BUILD_TYPE:         ${{ fromJSON(inputs.config).build_type }}
       SKIP_ARTIFACT_UPLOAD: ${{ fromJSON(inputs.config).skip_artifact_upload }}
+      SKIP_GITHUB_ARTIFACT: ${{ fromJSON(inputs.config).skip_github_artifact }}
     steps:
 
       - name: Keep the report token out of the logs
@@ -147,6 +148,7 @@ jobs:
               build_id = os.environ.get("LOVABLE_BUILD_ID", "")
               token = os.environ.get("REPORT_TOKEN", "")
               seen = set()
+              seen_names = set()
               artifacts = []
               for pattern in ([] if sandbox else sys.argv[2:]):
                   for path in sorted(glob.glob(pattern)):
@@ -154,6 +156,12 @@ jobs:
                           continue
                       seen.add(path)
                       name = os.path.basename(path)
+                      # Storage keeps one file per name, and Flutter leaves the
+                      # same app-release.apk in two folders. Reporting both made
+                      # report-build refuse the pair, so no file was recorded.
+                      if name in seen_names:
+                          continue
+                      seen_names.add(name)
                       lower = name.lower()
                       kind = ("apk" if lower.endswith(".apk")
                               else "aab" if lower.endswith(".aab")
@@ -331,6 +339,14 @@ jobs:
           elif [ "$mode" = "artifacts" ]; then
             # artifacts <glob> [<glob>...] — hash each file & POST size + sha256
             post_payload "$(make_payload artifacts "$@")"
+            # A build made without a plan keeps no copy of its file on the
+            # GitHub run (SKIP_GITHUB_ARTIFACT). That copy may only be skipped
+            # once Corenna has answered that it recorded a file: a failed
+            # upload, a refused file or no answer at all keeps it, so a
+            # finished build is never left with no file anywhere.
+            if [ "${SKIP_ARTIFACT_UPLOAD:-}" != "true" ] && ! grep -Eq '"artifacts_accepted":[[:space:]]*[1-9]' /tmp/lov_report_resp 2>/dev/null; then
+              echo "CORENNA_UPLOAD_FAILED=true" >> "$GITHUB_ENV"
+            fi
           elif [ "$mode" = "run" ]; then
             label="${1:-Step}"; shift || true
             tmp="$(mktemp)"
@@ -842,7 +858,7 @@ jobs:
             'build/app/outputs/apk/*/*.apk' \
             'build/app/outputs/bundle/*/*.aab'
       - name: Upload Flutter Android artifact
-        if: ${{ env.SKIP_ARTIFACT_UPLOAD != 'true' }}
+        if: ${{ env.SKIP_ARTIFACT_UPLOAD != 'true' && (env.SKIP_GITHUB_ARTIFACT != 'true' || env.CORENNA_UPLOAD_FAILED == 'true') }}
         uses: actions/upload-artifact@v4
         with:
           name: android-release-${{ env.BUILD_TYPE }}-${{ env.BUILD_NUMBER }}
