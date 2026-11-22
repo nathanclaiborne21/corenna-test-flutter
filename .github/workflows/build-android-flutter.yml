@@ -226,7 +226,14 @@ jobs:
             # containing error/failed/exception, else the last non-empty line.
             local file="$1"
             local s
-            s="$(grep -iE '(^npm (ERR!|error)|ERESOLVE|EUSAGE|Could not find|Unable to resolve|Capacitor.*(error|failed)|failed to|exception|fatal|denied)' "$file" 2>/dev/null | head -n 1 || true)"
+            # A Dart compile error names the file, line and problem. Flutter
+            # then prints "Target kernel_snapshot_program failed: Exception",
+            # which the generic pattern below picks instead and which says
+            # nothing about what to fix, so this is looked for first.
+            s="$(grep -E '\.dart:[0-9]+:[0-9]+: Error: ' "$file" 2>/dev/null | head -n 1 || true)"
+            if [ -z "$s" ]; then
+              s="$(grep -iE '(^npm (ERR!|error)|ERESOLVE|EUSAGE|Could not find|Unable to resolve|Capacitor.*(error|failed)|failed to|exception|fatal|denied)' "$file" 2>/dev/null | head -n 1 || true)"
+            fi
             if [ -z "$s" ]; then
               s="$(grep -iE 'error|failed|exception|fatal|denied' "$file" 2>/dev/null | head -n 1 || true)"
             fi
@@ -265,6 +272,14 @@ jobs:
               *"could not resolve entry module"*|*"no index.html"*|*"npm error code enoent"*|*"missing script: \"build\""*|*"no package.json"*|*"enoent: no such file or directory, open 'package.json'"*)
                 printf 'project_structure_error'; return ;;
             esac
+            # The app's own code doesn't compile ("lib/x.dart:11:20: Error:").
+            # Gradle wraps it in "Execution failed for task", so without this it
+            # lands in gradle_error. Before signing and timeout: the app's code
+            # quoted under the error can hold any word.
+            local dart_re='\.dart:[0-9]+:[0-9]+: error: '
+            if [[ "$lc" =~ $dart_re ]]; then
+              printf 'code_error'; return
+            fi
             case "$lc" in
               *"keystore"*|*"jarsigner"*|*"apksigner"*|*"code sign"*|*"codesign"*|*"provisioning profile"*|*"no signing certificate"*|*"apple_cert"*|*"android_key"*|*"signingconfig"*)
                 printf 'signing_error'; return ;;
